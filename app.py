@@ -14,14 +14,14 @@ st.markdown('''<style>
 [data-testid="stMetric"] {background:#f2f6f4;padding:14px;border-radius:12px}
 @media(max-width:650px){.block-container{padding:1rem .8rem 3rem}.stButton button{min-height:48px}div[data-testid="stHorizontalBlock"]{gap:.4rem}}
 </style>''',unsafe_allow_html=True)
-st.title('🚢 UK Freight Sales Intelligence · V4')
+st.title('🚢 UK Freight Sales Intelligence · V4.2')
 st.caption('HMRC trade evidence → prioritised UK freight prospects')
 
 @st.cache_data(ttl=3600,show_spinner=False)
-def fetch_traders(prefix, cap):
+def fetch_traders(prefix, cap, company_name=None):
     # Endpoint/field names based on published HMRC UK Trade Info OData conventions.
     url=urljoin(BASE,'Trader')
-    params={'$filter':f"startswith(PostCode,'{prefix}')",'$top':min(500,cap)}
+    params={'$filter':(f"contains(tolower(CompanyName),'{company_name.lower().replace(chr(39), chr(39)*2)}')" if company_name else f"startswith(PostCode,'{prefix}')"),'$top':min(500,cap)}
     rows=[]
     with requests.Session() as session:
         while url and len(rows)<cap:
@@ -69,6 +69,28 @@ def distance(a,b):
     x,y=map(math.radians,a);p,q=map(math.radians,b)
     h=math.sin((p-x)/2)**2+math.cos(x)*math.cos(p)*math.sin((q-y)/2)**2
     return 3958.7613*2*math.asin(min(1,math.sqrt(h)))
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def nearby_outcodes(postcode, miles):
+    """Postcodes.io outcode centroids; this is a candidate list, not a guaranteed radius census."""
+    with requests.Session() as session:
+        r=session.get('https://api.postcodes.io/postcodes/'+clean(postcode),timeout=25)
+        r.raise_for_status()
+        point=r.json().get('result')
+        if not point:raise ValueError('Origin postcode not found by Postcodes.io')
+        radius_m=min(24999,int(miles*1609.344+5000))
+        r=session.get('https://api.postcodes.io/outcodes',params={
+            'lon':point['longitude'],'lat':point['latitude'],'radius':radius_m,'limit':100},timeout=30)
+        r.raise_for_status()
+        found=r.json().get('result') or []
+        districts=sorted({str(x.get('outcode','')).upper().replace(' ','') for x in found if x.get('outcode')})
+        own=re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?',clean(postcode)).group()
+        if own not in districts:districts.append(own)
+        return sorted(set(districts)),len(found)>=100,radius_m< miles*1609.344+5000
+
+def outward_code(postcode):
+    m=re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?',clean(postcode))
+    return m.group() if m else ''
 
 def row_to_record(t):
     low={str(k).lower():v for k,v in t.items()}
@@ -210,7 +232,9 @@ def score_records(df, imports, exports):
         for flow in ('Import','Export'):
             codes.update(x.strip() for x in row[f'{flow} commodity codes (24m)'].split(',') if x.strip())
         return ', '.join(sorted({hs_chapters.get(code[:2],f'HS {code[:2]}') for code in codes})) or 'Unknown'
-    df['Commodity groups (indicative)']=df.apply(chapters,axis=1)
+    # Series.map retains a single column even for an empty filtered DataFrame.
+    df['Commodity groups (indicative)']=pd.Series(
+        (chapters(row) for _,row in df.iterrows()),index=df.index,dtype='object')
     df['Specialist handling review']=df['Commodity groups (indicative)'].str.contains('(review)',regex=False).map({True:'Check capability',False:'Not flagged — still verify'})
     df['Shipment volume estimate']='Not available — commodity-month lines are not shipments'
     df['Freight spend estimate']='Not available'
@@ -221,9 +245,14 @@ def score_records(df, imports, exports):
     return df,{'latest':latest,'months12':observed12,'months24':observed24,
                'start12':ym_from_index(end_index-11),'start24':ym_from_index(end_index-23)}
 
-mode=st.segmented_control('Search type',['Postcode area','Radius'],default='Postcode area')
-postcode=st.text_input('Postcode area / district' if mode=='Postcode area' else 'Full postcode',value='WS10' if mode=='Postcode area' else 'WS10 8AB')
-if mode=='Radius':radius=st.slider('Radius in miles',1,30,10)
+mode=st.segmented_control('Search type',['Company name','Postcode area','Radius'],default='Postcode area')
+if mode=='Company name':
+    search_value=st.text_input('Trader / company name',placeholder='e.g. Funko UK')
+elif mode=='Postcode area':
+    search_value=st.text_input('Postcode area / district',value='WS10')
+else:
+    search_value=st.text_input('Full postcode',value='CV3 4PW')
+    radius=st.slider('Radius in miles (approximate coverage)',1,15,10)
 limit=st.select_slider('Maximum traders',options=[100,250,500,1000,2000,5000],value=500)
 activity_limit=st.select_slider('Maximum activity records per direction',options=[2000,5000,10000,30000],value=10000)
 with st.expander('How to interpret the evidence'):
@@ -232,51 +261,91 @@ with st.expander('How to interpret the evidence'):
     st.write('If a trader or activity record cap is reached, activity scores are withheld or the trader list is flagged incomplete. Registered office locations may not be freight operating sites.')
 
 if st.button('🔎 Search HMRC traders',type='primary',use_container_width=True):
-    code=clean(postcode)
-    if mode=='Postcode area' and not re.fullmatch(r'[A-Z]{1,2}(\d{1,2}[A-Z]?)?',code):
+    code=clean(search_value)
+    if mode=='Company name' and len(search_value.strip())<3:
+        st.error('Enter at least 3 characters of the company name.')
+    elif mode=='Postcode area' and not re.fullmatch(r'[A-Z]{1,2}(\d{1,2}[A-Z]?)?',code):
         st.error('Enter an area or district such as WS or WS10.')
     elif mode=='Radius' and not re.fullmatch(r'[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}',code):
-        st.error('Enter a full postcode such as WS10 8AB.')
+        st.error('Enter a full postcode such as CV3 4PW.')
     else:
         try:
-            prefix=code if mode=='Postcode area' else re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?',code).group()
-            if mode=='Radius':st.warning('Radius coverage is incomplete: only traders in the origin postcode district are retrieved.')
             start,end=query_window()
-            incomplete=False
             st.session_state.pop('result',None)
             st.session_state.pop('coverage',None)
-            with st.spinner('Retrieving HMRC traders and import/export records…'):
-                traders,truncated=fetch_traders(prefix,limit)
+            incomplete=False; truncated=False; notes=[]
+            with st.spinner('Retrieving HMRC traders and trade evidence…'):
+                if mode=='Company name':
+                    traders,truncated=fetch_traders('',limit,company_name=search_value.strip())
+                    prefixes=sorted({outward_code(t.get('PostCode','')) for t in traders})
+                    prefixes=[x for x in prefixes if x]
+                elif mode=='Postcode area':
+                    prefixes=[code]
+                    traders,truncated=fetch_traders(code,limit)
+                else:
+                    prefixes,geo_cap,geo_range=nearby_outcodes(code,radius)
+                    if geo_cap:notes.append('Postcode district discovery reached the 100-outcode API limit; coverage may be incomplete.')
+                    if geo_range:notes.append('Postcode district discovery radius was limited by the geocoding API; coverage may be incomplete.')
+                    if len(prefixes)>35:
+                        notes.append(f'Only 35 of {len(prefixes)} candidate postcode districts searched; results are incomplete.')
+                        prefixes=prefixes[:35]
+                    traders=[]
+                    for pref in prefixes:
+                        remaining=limit-len(traders)
+                        if remaining<=0:truncated=True;break
+                        batch,cap_hit=fetch_traders(pref,remaining)
+                        traders.extend(batch)
+                        truncated=truncated or cap_hit
                 df=pd.DataFrame([row_to_record(t) for t in traders],columns=['Trader ID','Company','Postcode','Registered address'])
-                if not df.empty:
-                    if mode=='Postcode area' and re.search(r'\d',code):
-                        outward=df['Postcode'].astype(str).str.upper().str.replace(' ','',regex=False).str.extract(r'^([A-Z]{1,2}\d{1,2}[A-Z]?)',expand=False)
-                        df=df[outward==code].copy()
-                    if mode=='Radius':
-                        loc=lookup_postcodes(tuple(sorted(set([code]+[clean(x) for x in df['Postcode'].dropna()]))))
-                        if code not in loc:raise ValueError('Origin postcode not found')
-                        df['Miles away']=df['Postcode'].map(lambda x:round(distance(loc[code],loc[clean(x)]),1) if clean(x) in loc else float('nan'))
-                        df=df[df['Miles away']<=radius].copy()
-                    imports,imp_cap=fetch_activity(prefix,'Import',start,end,activity_limit)
-                    exports,exp_cap=fetch_activity(prefix,'Export',start,end,activity_limit)
-                    incomplete=imp_cap or exp_cap
-                    if not incomplete:
+                df=df.drop_duplicates(subset=['Trader ID'])
+                if mode=='Postcode area' and re.search(r'\d',code):
+                    df=df[df['Postcode'].map(outward_code)==code].copy()
+                if mode=='Radius' and not df.empty:
+                    loc=lookup_postcodes(tuple(sorted(set([code]+[clean(x) for x in df['Postcode'].dropna()]))))
+                    if code not in loc:raise ValueError('Origin postcode not found')
+                    df['Miles away']=df['Postcode'].map(lambda x:round(distance(loc[code],loc[clean(x)]),1) if clean(x) in loc else float('nan'))
+                    df=df[df['Miles away']<=radius].copy()
+                    missing_geo=len(traders)-len(loc)+1
+                    if missing_geo>0:notes.append('Some trader postcodes could not be geocoded and may have been excluded.')
+                if df.empty:
+                    notes.append('No matching traders found. Try a broader company name or postcode area.')
+                imports=[];exports=[]
+                # Search each postcode district separately and deduplicate activity records.
+                # Limits and partial coverage are surfaced rather than treated as complete evidence.
+                for pref in prefixes:
+                    if len(imports)>=activity_limit or len(exports)>=activity_limit:
+                        incomplete=True;break
+                    im,ic=fetch_activity(pref,'Import',start,end,activity_limit-len(imports))
+                    ex,ec=fetch_activity(pref,'Export',start,end,activity_limit-len(exports))
+                    imports.extend(im);exports.extend(ex)
+                    incomplete=incomplete or ic or ec
+                    if incomplete:break
+                if truncated:notes.append('Trader cap reached. Prospect coverage is partial.')
+                if incomplete:notes.append('Activity cap reached. Scores withheld because evidence may be incomplete.')
+                if not incomplete and not df.empty:
+                    # Activity queries are district-wide; only score the selected trader IDs.
+                    ids=set(df['Trader ID'].astype(str))
+                    imports=[x for x in imports if str(x.get('TraderId','')) in ids]
+                    exports=[x for x in exports if str(x.get('TraderId','')) in ids]
+                    if imports or exports:
                         df,coverage=score_records(df,imports,exports)
                         st.session_state['coverage']=coverage
                     else:
-                        st.warning('Activity record cap reached. Activity and tiers are withheld to avoid misleading rankings. Increase the activity limit or narrow the postcode search.')
-                    st.session_state['activity_incomplete']=incomplete
-            st.session_state['result']=df
-            st.session_state['truncated']=truncated
-            st.session_state['period']=(start,end)
-            st.session_state['activity_incomplete']=incomplete
+                        notes.append('No activity records for matched traders in this window; activity is unverified.')
+                        incomplete=True
+                st.session_state['result']=df
+                st.session_state['truncated']=truncated
+                st.session_state['period']=(start,end)
+                st.session_state['activity_incomplete']=incomplete
+                st.session_state['search_notes']=notes
         except Exception as exc:
-            st.error(f'HMRC search failed: {exc}')
-            st.info('The live API activity queries need validation on your deployed app. Check the app logs if this persists.')
+            st.error(f'Search failed: {exc}')
+            st.info('Check the Streamlit app logs for the full error details. An API failure does not mean the trader has no activity.')
 
 if 'result' in st.session_state:
     df=st.session_state['result'].copy()
     coverage=st.session_state.get('coverage') if not st.session_state.get('activity_incomplete') else None
+    for note in st.session_state.get('search_notes',[]):st.warning(note)
     if st.session_state.get('truncated'):
         st.warning('Trader retrieval hit the selected cap: this is a PARTIAL list, not all traders in the territory.')
     if st.session_state.get('activity_incomplete'):
@@ -332,4 +401,4 @@ if 'result' in st.session_state:
             'hmrc_full_evidence_v4.csv','text/csv',use_container_width=True)
         st.caption('AI enrichment: upload sales-ready CSV only to an organisation-approved platform; verify company identity, freight suitability and CRM ownership before outreach.')
 st.divider()
-st.caption('V4 prototype · HMRC API and reporting coverage require live validation · Radius mode is NOT a complete geographical search · No shipment counts or spend estimates are inferred.')
+st.caption('V4.2 beta · Company name and multi-district radius search · Radius coverage is approximate and may be incomplete · HMRC trade lines are not shipment counts.')
