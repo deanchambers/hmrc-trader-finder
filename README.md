@@ -1,9 +1,15 @@
-# HMRC Freight Sales Intelligence V4.3 — stability update
+# HMRC Trader Finder V4.5 — verified trade testing release
 
-Replace `app.py` in GitHub. `requirements.txt` remains unchanged.
+Replace `app.py` in your existing GitHub repository and commit to `main`. `requirements.txt` is unchanged.
 
-Fixes: dark-mode metric contrast; stable CSV schema when activity is unavailable; fallback for zero-result district queries; advanced activity safety limit; diagnostics; explicit partial-radius warnings.
+## Tests
+1. Company name: `Funko UK` (known published-trade test case; reported HMRC Trader ID 223983). Confirm the matched Trader ID and inspect import/export months, codes, and HMRC profile link.
+2. Company name: `All About Food Limited` (known published-trade test case). Confirm the Trader ID, import/export activity and latest month.
+3. If either test shows zero verified prospects, disable **Show verified trading prospects only** and inspect **Retrieval diagnostics**. This is an API retrieval/matching failure until independently resolved; do not interpret it as no trade.
+4. Only after both company tests pass, try postcode `CV3` and `M1` and then radius.
 
-**Not production-certified.** Live HMRC API endpoints, pagination completeness, postcode district matching, publication coverage, activity-to-trader joins, and geospatial coverage still require independent end-to-end validation. HMRC commodity-month lines are not shipments. Radius discovery is sampled if trader caps or outcode limits are reached.
-
-Test: Funko, TF2, TF, WS10, CV3 4PW radius. Compare Trader IDs and activity with HMRC source. Review diagnostics.
+## Important
+- Published UK Trade Info commodity-month lines are **not individual shipments** and cannot determine freight spend.
+- This version adds a default verified-trade-only view, source links, and diagnostics; it does **not** solve the existing district-wide activity pagination/coverage limitation.
+- Trader candidate caps and incomplete radius postcode discovery can omit genuine traders. Do not use as an exhaustive territory list or production rollout yet.
+- Data sources are public HMRC UK Trade Info API and postcodes.io.

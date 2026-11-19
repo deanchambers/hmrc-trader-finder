@@ -14,7 +14,7 @@ st.markdown('''<style>
 [data-testid="stMetric"] {background:#172b35 !important;border:1px solid #42616c;padding:14px;border-radius:12px} [data-testid="stMetric"] label,[data-testid="stMetric"] [data-testid="stMetricValue"],[data-testid="stMetric"] p {color:#ffffff !important;opacity:1 !important} [data-testid="stMetricValue"] {font-weight:800 !important}
 @media(max-width:650px){.block-container{padding:1rem .8rem 3rem}.stButton button{min-height:48px}div[data-testid="stHorizontalBlock"]{gap:.4rem}}
 </style>''',unsafe_allow_html=True)
-st.title('🚢 UK Freight Sales Intelligence · V4.3')
+st.title('🚢 UK Freight Sales Intelligence · V4.5')
 st.caption('HMRC trade evidence → prioritised UK freight prospects')
 
 @st.cache_data(ttl=3600,show_spinner=False)
@@ -139,6 +139,35 @@ def fetch_activity(prefix,flow,start,end,cap=100000):
             if not chunk:break
     return records,bool(url)
 
+@st.cache_data(ttl=3600,show_spinner=False)
+def fetch_trader_activity(trader_id, flow, start, end, cap=50000):
+    """Fetch activity BY TraderId; never use a busy postcode district as a proxy."""
+    url=urljoin(BASE,flow)
+    params={'$filter':f'TraderId eq {int(trader_id)} and MonthId ge {start} and MonthId le {end}',
+            '$select':'TraderId,MonthId,CommodityId','$top':min(2000,cap)}
+    records=[]
+    with requests.Session() as session:
+        while url and len(records)<cap:
+            for attempt in range(4):
+                try:
+                    r=session.get(url,params=params,timeout=50,headers={'Accept':'application/json'})
+                    if r.status_code in (429,500,502,503,504) and attempt<3:
+                        time.sleep(2**attempt+1);continue
+                    r.raise_for_status();break
+                except requests.RequestException:
+                    if attempt==3:raise
+                    time.sleep(2**attempt+1)
+            payload=r.json()
+            chunk=payload.get('value',[])
+            if not isinstance(chunk,list):raise ValueError('Unexpected trader activity response')
+            records.extend(chunk[:cap-len(records)])
+            nxt=payload.get('@odata.nextLink')
+            url=urljoin(BASE,nxt) if nxt else None
+            if url and not url.startswith(BASE):raise ValueError('Unexpected HMRC pagination URL')
+            params=None
+            if not chunk:break
+    return records,bool(url)
+
 def month_label(value):
     if value is None or pd.isna(value):
         return 'Not observed'
@@ -253,10 +282,11 @@ elif mode=='Postcode area':
 else:
     search_value=st.text_input('Full postcode',value='CV3 4PW')
     radius=st.slider('Radius in miles (approximate coverage)',1,15,10)
-limit=st.select_slider('Maximum traders',options=[100,250,500,1000,2000,5000],value=500)
+limit=st.select_slider('Maximum candidate traders (not a limit on shipments)',options=[100,250,500,1000,2000,5000],value=500)
 with st.expander('Advanced retrieval settings',expanded=False):
     activity_limit=st.select_slider('Safety limit: activity records per direction',options=[10000,30000,60000,100000,200000],value=100000)
     st.caption('This is a safety limit for API retrieval, NOT a shipment limit. If reached, activity scoring is withheld. Larger searches may be slow.')
+verified_only=st.checkbox('Show verified trading prospects only',value=True,key='verified_filter',help='Hide directory-only accounts. A verified record means at least one published commodity-month import or export record within the 24-month analysis window.')
 with st.expander('How to interpret the evidence'):
     st.write('The app queries up to 30 calendar months of published HMRC commodity-month records and compares the latest 12 and 24 months ending with the most recent month observed in THIS search. This is a local proxy, not a verified national publication calendar.')
     st.write('Tier A: 10–12 active months in either trade direction; B: 4–9; C: 1–3. Activity is not shipment frequency or freight value. Priority is a research heuristic, not a sales forecast.')
@@ -324,14 +354,25 @@ if st.button('🔎 Search HMRC traders',type='primary',use_container_width=True)
                 imports=[];exports=[]
                 # Search each postcode district separately and deduplicate activity records.
                 # Limits and partial coverage are surfaced rather than treated as complete evidence.
-                for pref in (prefixes if not df.empty else []):
-                    if len(imports)>=activity_limit or len(exports)>=activity_limit:
-                        incomplete=True;break
-                    im,ic=fetch_activity(pref,'Import',start,end,activity_limit-len(imports))
-                    ex,ec=fetch_activity(pref,'Export',start,end,activity_limit-len(exports))
-                    imports.extend(im);exports.extend(ex)
-                    incomplete=incomplete or ic or ec
-                    if incomplete:break
+                if mode=='Company name' and not df.empty:
+                    # Targeted company search: exact trader IDs, independent of postcode activity density.
+                    for tid in df['Trader ID']:
+                        if len(imports)>=activity_limit or len(exports)>=activity_limit:
+                            incomplete=True;break
+                        im,ic=fetch_trader_activity(tid,'Import',start,end,activity_limit-len(imports))
+                        ex,ec=fetch_trader_activity(tid,'Export',start,end,activity_limit-len(exports))
+                        imports.extend(im);exports.extend(ex)
+                        incomplete=incomplete or ic or ec
+                        if incomplete:break
+                else:
+                    for pref in (prefixes if not df.empty else []):
+                        if len(imports)>=activity_limit or len(exports)>=activity_limit:
+                            incomplete=True;break
+                        im,ic=fetch_activity(pref,'Import',start,end,activity_limit-len(imports))
+                        ex,ec=fetch_activity(pref,'Export',start,end,activity_limit-len(exports))
+                        imports.extend(im);exports.extend(ex)
+                        incomplete=incomplete or ic or ec
+                        if incomplete:break
                 if truncated:notes.append('Trader retrieval limit reached BEFORE geographic filtering. Radius results are a SAMPLE, not all traders within the circle.')
                 if incomplete:notes.append('Trade activity retrieval was incomplete or hit the safety limit; scores withheld.')
                 if not incomplete and not df.empty:
@@ -343,7 +384,7 @@ if st.button('🔎 Search HMRC traders',type='primary',use_container_width=True)
                         df,coverage=score_records(df,imports,exports)
                         st.session_state['coverage']=coverage
                     else:
-                        notes.append('No activity records matched these trader IDs. This does not establish that the companies have no trade; API joins and published reporting coverage need verification.')
+                        notes.append('No dated import/export evidence matched these trader IDs in the selected window. Check HMRC trader details and reporting period.')
                         incomplete=True
                 st.session_state['result']=df
                 st.session_state['truncated']=truncated
@@ -357,6 +398,8 @@ if st.button('🔎 Search HMRC traders',type='primary',use_container_width=True)
 
 if 'result' in st.session_state:
     df=st.session_state['result'].copy()
+    # Preserve the verified-only preference between Streamlit reruns.
+    verified_only=st.session_state.get('verified_filter',True)
     coverage=st.session_state.get('coverage') if not st.session_state.get('activity_incomplete') else None
     for note in st.session_state.get('search_notes',[]):st.warning(note)
     if st.session_state.get('truncated'):
@@ -378,6 +421,8 @@ if 'result' in st.session_state:
         elif direction=='Exporter':df=df[df['Export active months (12m)']>0]
         elif direction!='All':df=df[df['Trade direction']==direction]
         df=df[df['Tier'].isin(tiers)&df['Sales priority'].isin(priorities)&df['Trend'].isin(trends)]
+        if verified_only:
+            df=df[(df['Import active months (24m)']>0)|(df['Export active months (24m)']>0)].copy()
         df=df[df[['Import active months (12m)','Export active months (12m)']].max(axis=1)>=min_months]
         terms=[x.strip() for x in exclude.split(',') if x.strip()]
         if terms:
@@ -391,6 +436,11 @@ if 'result' in st.session_state:
         df=df.assign(_rank=df['Sales priority'].map(rank)).sort_values(
             ['_rank','Import active months (12m)','Export active months (12m)'],
             ascending=[True,False,False]).drop(columns='_rank')
+    if not coverage and verified_only:
+        # Never present unverified directory accounts as qualified prospects.
+        df=df.iloc[0:0].copy()
+    if not df.empty:
+        df['HMRC trader profile']=df.apply(lambda r: 'https://www.uktradeinfo.com/traders/'+re.sub(r'[^a-z0-9]+','-',str(r['Company']).lower()).strip('-')+'-'+str(r['Trader ID']),axis=1)
     # Schema stability: retrieval failures must never crash tables or CSV downloads.
     defaults={'Trade direction':'Unverified','Tier':'Unverified','Sales priority':'Research',
               'Trend':'Unknown','Commodity groups (indicative)':'Unknown',
@@ -407,23 +457,24 @@ if 'result' in st.session_state:
     c.metric('High priority',f'{(df["Sales priority"]=="High").sum():,}' if 'Sales priority' in df else '—')
     with st.expander('Retrieval diagnostics',expanded=False):
         st.json(st.session_state.get('retrieval_diagnostics',{}))
+        st.caption('A zero activity count is not conclusive if retrieval is incomplete. For company-name tests, check that records were returned by the TraderId-filtered import/export requests.')
     if df.empty:
-        st.info('No matching records. Try changing filters or territory.')
+        st.info('No VERIFIED trading prospects can be shown from this search. If evidence retrieval failed, this is NOT proof that companies have no trade. Turn off the verified-only checkbox to inspect discovered directory accounts and review retrieval diagnostics.')
     else:
         focus=['Company','Postcode','Trade direction','Tier','Sales priority',
                'Import active months (12m)','Export active months (12m)',
                'Import active months (24m)','Export active months (24m)',
-               'Latest import','Latest export','Trend','Commodity groups (indicative)','Specialist handling review','Sales rationale']
+               'Latest import','Latest export','Trend','HMRC trader profile','Commodity groups (indicative)','Specialist handling review','Sales rationale']
         st.subheader('Prospect shortlist')
         st.dataframe(df[[x for x in focus if x in df]],hide_index=True,use_container_width=True)
         with st.expander('Full analytical dataset'):
             st.dataframe(df,hide_index=True,use_container_width=True)
         st.download_button('⬇️ Export sales-ready CSV',
             df[[x for x in focus if x in df]+[x for x in ['Trader ID','Registered address','CRM status','Site confidence','Contact enrichment'] if x in df.columns]].to_csv(index=False).encode('utf-8-sig'),
-            'hmrc_sales_ready_v4.csv','text/csv',use_container_width=True)
+            'hmrc_sales_ready_v4_5.csv','text/csv',use_container_width=True)
         st.download_button('⬇️ Export full evidence CSV',
             df.to_csv(index=False).encode('utf-8-sig'),
-            'hmrc_full_evidence_v4.csv','text/csv',use_container_width=True)
+            'hmrc_full_evidence_v4_5.csv','text/csv',use_container_width=True)
         st.caption('AI enrichment: upload sales-ready CSV only to an organisation-approved platform; verify company identity, freight suitability and CRM ownership before outreach.')
 st.divider()
-st.caption('V4.3 beta · Company name and multi-district radius search · Radius coverage is a sampled approximation and may be incomplete · HMRC trade lines are not shipment counts.')
+st.caption('V4.5 validation release · Company name and multi-district radius search · Radius coverage is a sampled approximation and may be incomplete · HMRC trade lines are not shipment counts.')
