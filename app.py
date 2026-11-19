@@ -1,3 +1,5 @@
+"""UK Freight Sales Intelligence V4.6 — one trader-ID evidence path for every search mode."""
+import concurrent.futures
 import math
 import re
 import time
@@ -7,474 +9,273 @@ import pandas as pd
 import requests
 import streamlit as st
 
-BASE = 'https://api.uktradeinfo.com/'
-st.set_page_config(page_title='UK Trader Finder', page_icon='🚢', layout='wide', initial_sidebar_state='collapsed')
-st.markdown('''<style>
-.block-container {padding-top:1.25rem;max-width:1100px}
-[data-testid="stMetric"] {background:#172b35 !important;border:1px solid #42616c;padding:14px;border-radius:12px} [data-testid="stMetric"] label,[data-testid="stMetric"] [data-testid="stMetricValue"],[data-testid="stMetric"] p {color:#ffffff !important;opacity:1 !important} [data-testid="stMetricValue"] {font-weight:800 !important}
-@media(max-width:650px){.block-container{padding:1rem .8rem 3rem}.stButton button{min-height:48px}div[data-testid="stHorizontalBlock"]{gap:.4rem}}
-</style>''',unsafe_allow_html=True)
-st.title('🚢 UK Freight Sales Intelligence · V4.5')
-st.caption('HMRC trade evidence → prioritised UK freight prospects')
+BASE='https://api.uktradeinfo.com/'
+st.set_page_config(page_title='UK Freight Sales Intelligence',page_icon='🚢',layout='wide',initial_sidebar_state='collapsed')
+st.markdown('''<style>.block-container{max-width:1150px;padding-top:1.1rem}[data-testid="stMetric"]{background:#142d3a!important;border:1px solid #426575;padding:12px;border-radius:12px}[data-testid="stMetric"] label,[data-testid="stMetric"] p,[data-testid="stMetricValue"]{color:#fff!important;opacity:1!important}[data-testid="stMetricValue"]{font-weight:800!important}@media(max-width:650px){.block-container{padding:1rem .75rem 3rem}.stButton button{min-height:46px}}</style>''',unsafe_allow_html=True)
+st.title('🚢 UK Freight Sales Intelligence · V4.6')
+st.caption('HMRC published trade evidence • consistent Trader ID matching • sales-first shortlist')
 
-@st.cache_data(ttl=3600,show_spinner=False)
-def fetch_traders(prefix, cap, company_name=None):
-    # Endpoint/field names based on published HMRC UK Trade Info OData conventions.
-    url=urljoin(BASE,'Trader')
-    params={'$filter':(f"contains(tolower(CompanyName),'{company_name.lower().replace(chr(39), chr(39)*2)}')" if company_name else f"startswith(PostCode,'{prefix}')"),'$top':min(500,cap)}
-    rows=[]
-    with requests.Session() as session:
-        while url and len(rows)<cap:
-            response=None
-            for attempt in range(4):
-                try:
-                    response=session.get(url,params=params,timeout=40,headers={'Accept':'application/json'})
-                    if response.status_code in (429,500,502,503,504) and attempt<3:
-                        time.sleep(2**attempt)
-                        continue
-                    response.raise_for_status()
-                    break
-                except requests.RequestException:
-                    if attempt==3:raise
-                    time.sleep(2**attempt)
-            payload=response.json()
-            chunk=payload.get('value',[])
-            if not isinstance(chunk,list):raise ValueError('Unexpected HMRC response')
-            rows.extend(chunk[:cap-len(rows)])
-            nxt=payload.get('@odata.nextLink')
-            url=urljoin(BASE,nxt) if nxt else None
-            if url and not url.startswith(BASE):raise ValueError('Unexpected HMRC pagination URL')
-            params=None
-            if not chunk:break
-    return rows, bool(url)
-
-@st.cache_data(ttl=86400,show_spinner=False)
-def lookup_postcodes(codes):
-    found={}
-    with requests.Session() as session:
-        for i in range(0,len(codes),100):
-            batch=codes[i:i+100]
-            try:
-                r=session.post('https://api.postcodes.io/postcodes',json={'postcodes':batch},timeout=25)
-                r.raise_for_status()
-                for item in r.json().get('result',[]):
-                    v=item.get('result')
-                    if v and v.get('latitude') is not None:
-                        found[clean(item['query'])]=(v['latitude'],v['longitude'])
-            except requests.RequestException:pass
-    return found
-
-def clean(s):return re.sub(r'\s+','',str(s or '').upper())
-def distance(a,b):
-    x,y=map(math.radians,a);p,q=map(math.radians,b)
-    h=math.sin((p-x)/2)**2+math.cos(x)*math.cos(p)*math.sin((q-y)/2)**2
-    return 3958.7613*2*math.asin(min(1,math.sqrt(h)))
-
-@st.cache_data(ttl=86400,show_spinner=False)
-def nearby_outcodes(postcode, miles):
-    """Postcodes.io outcode centroids; this is a candidate list, not a guaranteed radius census."""
-    with requests.Session() as session:
-        r=session.get('https://api.postcodes.io/postcodes/'+clean(postcode),timeout=25)
-        r.raise_for_status()
-        point=r.json().get('result')
-        if not point:raise ValueError('Origin postcode not found by Postcodes.io')
-        radius_m=min(24999,int(miles*1609.344+5000))
-        r=session.get('https://api.postcodes.io/outcodes',params={
-            'lon':point['longitude'],'lat':point['latitude'],'radius':radius_m,'limit':100},timeout=30)
-        r.raise_for_status()
-        found=r.json().get('result') or []
-        districts=sorted({str(x.get('outcode','')).upper().replace(' ','') for x in found if x.get('outcode')})
-        own=re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?',clean(postcode)).group()
-        if own not in districts:districts.append(own)
-        return sorted(set(districts)),len(found)>=100,radius_m< miles*1609.344+5000
-
-def outward_code(postcode):
-    m=re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?',clean(postcode))
-    return m.group() if m else ''
-
-def row_to_record(t):
-    low={str(k).lower():v for k,v in t.items()}
-    return {'Trader ID':low.get('traderid',''),'Company':low.get('tradername',low.get('name',low.get('companyname',''))),
-            'Postcode':low.get('postcode',''),'Registered address':', '.join(str(v) for k,v in t.items() if 'address' in k.lower() and v)}
-
-def ym_from_index(index):
-    return (index // 12) * 100 + index % 12 + 1
-
-def month_index(value):
-    value=int(value)
-    return (value // 100) * 12 + value % 100 - 1
-
-def query_window():
-    now=date.today()
-    last_complete=now.year*12+now.month-2
-    # 30 months: allow for delayed publication, while still analysing 24 published months.
-    return ym_from_index(last_complete-29), ym_from_index(last_complete)
-
-@st.cache_data(ttl=3600,show_spinner=False)
-def fetch_activity(prefix,flow,start,end,cap=100000):
-    # Query published commodity-month records, not individual shipment declarations.
-    url=urljoin(BASE,flow)
-    params={'$filter':f"MonthId ge {start} and MonthId le {end} and startswith(Trader/PostCode,'{prefix}')",
-            '$select':'TraderId,MonthId,CommodityId','$top':min(2000,cap)}
-    records=[]
-    with requests.Session() as session:
-        while url and len(records)<cap:
-            for attempt in range(4):
-                try:
-                    r=session.get(url,params=params,timeout=50,headers={'Accept':'application/json'})
-                    if r.status_code in (429,500,502,503,504) and attempt<3:
-                        time.sleep(2**attempt+1);continue
-                    r.raise_for_status();break
-                except requests.RequestException:
-                    if attempt==3:raise
-                    time.sleep(2**attempt+1)
-            payload=r.json()
-            chunk=payload.get('value',[])
-            if not isinstance(chunk,list):raise ValueError('Unexpected activity response')
-            records.extend(chunk[:cap-len(records)])
-            next_url=payload.get('@odata.nextLink')
-            url=urljoin(BASE,next_url) if next_url else None
-            if url and not url.startswith(BASE):raise ValueError('Unexpected pagination URL')
-            params=None
-            if not chunk:break
-    return records,bool(url)
-
-@st.cache_data(ttl=3600,show_spinner=False)
-def fetch_trader_activity(trader_id, flow, start, end, cap=50000):
-    """Fetch activity BY TraderId; never use a busy postcode district as a proxy."""
-    url=urljoin(BASE,flow)
-    params={'$filter':f'TraderId eq {int(trader_id)} and MonthId ge {start} and MonthId le {end}',
-            '$select':'TraderId,MonthId,CommodityId','$top':min(2000,cap)}
-    records=[]
-    with requests.Session() as session:
-        while url and len(records)<cap:
-            for attempt in range(4):
-                try:
-                    r=session.get(url,params=params,timeout=50,headers={'Accept':'application/json'})
-                    if r.status_code in (429,500,502,503,504) and attempt<3:
-                        time.sleep(2**attempt+1);continue
-                    r.raise_for_status();break
-                except requests.RequestException:
-                    if attempt==3:raise
-                    time.sleep(2**attempt+1)
-            payload=r.json()
-            chunk=payload.get('value',[])
-            if not isinstance(chunk,list):raise ValueError('Unexpected trader activity response')
-            records.extend(chunk[:cap-len(records)])
-            nxt=payload.get('@odata.nextLink')
-            url=urljoin(BASE,nxt) if nxt else None
-            if url and not url.startswith(BASE):raise ValueError('Unexpected HMRC pagination URL')
-            params=None
-            if not chunk:break
-    return records,bool(url)
-
-def month_label(value):
-    if value is None or pd.isna(value):
-        return 'Not observed'
-    value=int(value)
-    return f'{value//100:04d}-{value%100:02d}'
-
-def valid_month(value):
+def clean(v):return re.sub(r'\s+','',str(v or '').upper())
+def outcode(v):
+    # UK full postcodes end in the three-character inward code (e.g. CV34PB -> CV3).
+    raw=clean(v)
+    return raw[:-3] if re.fullmatch(r'[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}',raw) else ''
+def month_idx(v):
+    y,m=divmod(int(v),100)
+    return y*12+m-1
+def ym(i):return (i//12)*100+i%12+1
+def valid_ym(v):
     try:
-        x=int(value)
-        return 1 <= x%100 <= 12 and 2000 <= x//100 <= 2100
-    except (TypeError,ValueError):
-        return False
+        y,m=divmod(int(v),100)
+        return 2000<=y<=2100 and 1<=m<=12
+    except (ValueError,TypeError):return False
+def month_name(v):return f'{int(v)//100:04d}-{int(v)%100:02d}' if v is not None else 'Not observed'
+def row(t):
+    x={str(k).lower():v for k,v in t.items()}
+    return {'Trader ID':str(x.get('traderid','')).strip(),'Company':str(x.get('tradername') or x.get('companyname') or x.get('name') or ''),'Postcode':str(x.get('postcode') or ''),'Registered address':', '.join(str(v) for k,v in t.items() if 'address' in str(k).lower() and v)}
 
-def activity_index(records):
-    indexed={}
-    all_months=set()
-    for item in records:
-        low={str(k).lower():v for k,v in item.items()}
-        tid=low.get('traderid')
-        month=low.get('monthid')
-        if tid is None or not valid_month(month):
-            continue
-        month=int(month)
-        all_months.add(month)
-        rec=indexed.setdefault(str(tid),[])
-        rec.append((month,str(low.get('commodityid',''))))
-    return indexed,all_months
+def api_get(url,params=None):
+    for attempt in range(4):
+        try:
+            r=requests.get(url,params=params,headers={'Accept':'application/json'},timeout=40)
+            if r.status_code in (429,500,502,503,504) and attempt<3:
+                time.sleep(1.5*(attempt+1));continue
+            r.raise_for_status()
+            obj=r.json()
+            if not isinstance(obj,dict) or not isinstance(obj.get('value'),list):raise ValueError('Unexpected HMRC response shape')
+            return obj
+        except requests.RequestException:
+            if attempt==3:raise
+            time.sleep(1.5*(attempt+1))
 
-def score_records(df, imports, exports):
-    imp, imp_months=activity_index(imports)
-    exp, exp_months=activity_index(exports)
-    available=imp_months | exp_months
-    if not available:
-        # Cannot infer reporting coverage from empty activity responses.
-        raise ValueError('No dated activity records were returned; cannot safely score traders.')
-    latest=max(available)
-    end_index=month_index(latest)
-    window12=set(ym_from_index(i) for i in range(end_index-11,end_index+1))
-    window24=set(ym_from_index(i) for i in range(end_index-23,end_index+1))
-    # These are months seen anywhere in this search, NOT proof of national publication completeness.
-    observed12=len(available & window12)
-    observed24=len(available & window24)
-    for flow,records in [('Import',imp),('Export',exp)]:
-        for span,months in [(12,window12),(24,window24)]:
-            df[f'{flow} active months ({span}m)']=df['Trader ID'].map(
-                lambda t:len({m for m,c in records.get(str(t),[]) if m in months}))
-            df[f'{flow} published lines ({span}m)']=df['Trader ID'].map(
-                lambda t:sum(m in months for m,c in records.get(str(t),[])))
-        df[f'{flow} distinct commodity codes (24m)']=df['Trader ID'].map(
-            lambda t:len({c for m,c in records.get(str(t),[]) if m in window24 and c}))
-        df[f'{flow} commodity codes (24m)']=df['Trader ID'].map(
-            lambda t:', '.join(sorted({c for m,c in records.get(str(t),[]) if m in window24 and c})))
-        df[f'Latest {flow.lower()}']=df['Trader ID'].map(
-            lambda t:month_label(max([m for m,c in records.get(str(t),[]) if m in window24],default=None)))
-        df[f'First {flow.lower()} (24m)']=df['Trader ID'].map(
-            lambda t:month_label(min([m for m,c in records.get(str(t),[]) if m in window24],default=None)))
-        df[f'{flow} months since last']=df['Trader ID'].map(
-            lambda t:end_index-month_index(max([m for m,c in records.get(str(t),[]) if m in window24]))
-            if any(m in window24 for m,c in records.get(str(t),[])) else None)
-    im=df['Import active months (12m)']; ex=df['Export active months (12m)']
-    im24=df['Import active months (24m)']; ex24=df['Export active months (24m)']
-    df['Trade direction']=['Both' if i and e else 'Importer' if i else 'Exporter' if e else
-                           'Historical / review' if a or b else 'Not observed'
-                           for i,e,a,b in zip(im,ex,im24,ex24)]
-    peak=pd.concat([im,ex],axis=1).max(axis=1)
-    df['Tier']=peak.map(lambda n:'A' if n>=10 else 'B' if n>=4 else 'C' if n>=1 else 'Unconfirmed')
-    df['Trend']=['Newer / growing' if max(i,e)>max(a-i,b-e)+2 else
-                 'Reduced activity' if max(a-i,b-e)>max(i,e)+2 else
-                 'Steady / mixed' if i+e+a+b else 'Unknown'
-                 for i,e,a,b in zip(im,ex,im24,ex24)]
-    last=df[['Import months since last','Export months since last']].min(axis=1)
-    df['Recency']=last.map(lambda n:'Unknown' if pd.isna(n) else 'Recent' if n<=2 else
-                            'Moderate' if n<=5 else 'Older')
-    df['Sales priority']=['Research' if tier=='Unconfirmed' else
-                          'High' if tier=='A' and rec=='Recent' else
-                          'Medium' if tier in ('A','B') and rec in ('Recent','Moderate') else 'Low'
-                          for tier,rec in zip(df['Tier'],df['Recency'])]
-    df['Sales rationale']=[f'{direction}; imports {i}/12 months ({a}/24), exports {e}/12 ({b}/24); '
-                           f'latest import {li}, export {le}; {trend.lower()}. Validate freight fit and CRM ownership.'
-                           for direction,i,e,a,b,li,le,trend in zip(
-                           df['Trade direction'],im,ex,im24,ex24,df['Latest import'],df['Latest export'],df['Trend'])]
-    hs_chapters={'22':'Beverages / alcohol (review)','27':'Mineral fuels (review)',
-                 '29':'Organic chemicals (review)','30':'Pharmaceuticals (review)',
-                 '39':'Plastics','40':'Rubber','44':'Wood','48':'Paper / packaging',
-                 '52':'Cotton / textiles','61':'Knitted apparel','62':'Woven apparel',
-                 '72':'Iron / steel','73':'Iron / steel articles','76':'Aluminium',
-                 '84':'Machinery','85':'Electrical equipment','87':'Vehicles / parts',
-                 '90':'Precision instruments'}
-    def chapters(row):
-        codes=set()
-        for flow in ('Import','Export'):
-            codes.update(x.strip() for x in row[f'{flow} commodity codes (24m)'].split(',') if x.strip())
-        return ', '.join(sorted({hs_chapters.get(code[:2],f'HS {code[:2]}') for code in codes})) or 'Unknown'
-    # Series.map retains a single column even for an empty filtered DataFrame.
-    df['Commodity groups (indicative)']=pd.Series(
-        (chapters(row) for _,row in df.iterrows()),index=df.index,dtype='object')
-    df['Specialist handling review']=df['Commodity groups (indicative)'].str.contains('(review)',regex=False).map({True:'Check capability',False:'Not flagged — still verify'})
-    df['Shipment volume estimate']='Not available — commodity-month lines are not shipments'
-    df['Freight spend estimate']='Not available'
-    df['Site confidence']='Registered / supplied postcode — operating site unverified'
-    df['CRM status']='Not checked'
-    df['Contact enrichment']='Not performed'
-    df['Data window end']=month_label(latest)
-    return df,{'latest':latest,'months12':observed12,'months24':observed24,
-               'start12':ym_from_index(end_index-11),'start24':ym_from_index(end_index-23)}
+def paged(endpoint,filter_text,select=None,max_rows=10000):
+    url=urljoin(BASE,endpoint)
+    params={'$filter':filter_text,'$top':min(2000,max_rows)}
+    if select:params['$select']=select
+    result=[];pages=0;seen=set()
+    while url and len(result)<max_rows:
+        if url in seen:raise ValueError('Repeated HMRC pagination URL')
+        seen.add(url)
+        payload=api_get(url,params)
+        chunk=payload['value'];pages+=1
+        result.extend(chunk[:max_rows-len(result)])
+        nxt=payload.get('@odata.nextLink')
+        url=urljoin(BASE,nxt) if nxt else None
+        if url and not url.startswith(BASE):raise ValueError('Unsafe pagination URL')
+        params=None
+        if not chunk:break
+    return result,bool(url),pages
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def traders_by_name(name,max_rows):
+    escaped=name.lower().replace("'","''")
+    return paged('Trader',f"contains(tolower(CompanyName),'{escaped}')",max_rows=max_rows)
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def traders_by_prefix(prefix,max_rows):
+    # HMRC postcode filters have proved inconsistent for some districts. Try direct,
+    # then a broader-area scan; never claim that a capped fallback is exhaustive.
+    found,cap,pages=paged('Trader',f"startswith(PostCode,'{prefix}')",max_rows=max_rows)
+    if found or not re.search(r'\d',prefix):return found,cap,pages,'direct'
+    area=re.match(r'^[A-Z]{1,2}',prefix).group()
+    broader,bcap,bpages=paged('Trader',f"startswith(PostCode,'{area}')",max_rows=max(max_rows,15000))
+    exact=[t for t in broader if outcode(t.get('PostCode',''))==prefix]
+    return exact,bcap,bpages,'area fallback'+(' (incomplete)' if bcap else '')
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def trader_activity(tid,flow,start,end,max_rows):
+    if not re.fullmatch(r'\d+',str(tid)):raise ValueError(f'Unexpected Trader ID {tid!r}')
+    return paged(flow,f'TraderId eq {tid} and MonthId ge {start} and MonthId le {end}',
+                 select='TraderId,MonthId,CommodityId',max_rows=max_rows)
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def location_for_postcodes(postcodes):
+    result={}
+    for i in range(0,len(postcodes),100):
+        batch=list(postcodes[i:i+100])
+        r=requests.post('https://api.postcodes.io/postcodes',json={'postcodes':batch},timeout=30)
+        r.raise_for_status()
+        for item in r.json().get('result',[]):
+            p=item.get('result')
+            if p and p.get('latitude') is not None:result[clean(item['query'])]=(p['latitude'],p['longitude'])
+    return result
+
+def miles(a,b):
+    x,y=map(math.radians,a);p,q=map(math.radians,b)
+    z=math.sin((p-x)/2)**2+math.cos(x)*math.cos(p)*math.sin((q-y)/2)**2
+    return 3958.7613*2*math.asin(min(1,math.sqrt(z)))
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def radius_outcodes(postcode,radius):
+    p=requests.get('https://api.postcodes.io/postcodes/'+clean(postcode),timeout=25)
+    p.raise_for_status();origin=p.json().get('result')
+    if not origin:raise ValueError('Full postcode not found')
+    requested=int(radius*1609.344+5000);actual=min(requested,24999)
+    r=requests.get('https://api.postcodes.io/outcodes',params={'lon':origin['longitude'],'lat':origin['latitude'],'radius':actual,'limit':100},timeout=30)
+    r.raise_for_status();items=r.json().get('result') or []
+    codes=sorted({clean(x.get('outcode')) for x in items if x.get('outcode')}|{outcode(postcode)})
+    return codes,len(items)>=100,actual<requested
+
+def evidence_for_trader(tid,start,end,max_rows):
+    im,ic,ip=trader_activity(tid,'Import',start,end,max_rows)
+    ex,ec,ep=trader_activity(tid,'Export',start,end,max_rows)
+    # Do not silently score a partially retrieved trader.
+    return str(tid),im,ex,ic or ec,ip+ep
+
+def evidence_months(records,tid):
+    out=[];bad=0
+    for x in records:
+        low={str(k).lower():v for k,v in x.items()}
+        if str(low.get('traderid',''))!=str(tid) or not valid_ym(low.get('monthid')):
+            bad+=1;continue
+        out.append((int(low['monthid']),str(low.get('commodityid') or '')))
+    return out,bad
+
+def score(trader,im,ex,anchor):
+    tid=trader['Trader ID'];im,bad1=evidence_months(im,tid);ex,bad2=evidence_months(ex,tid)
+    if bad1+bad2:raise ValueError(f'{bad1+bad2} activity records have invalid trader IDs or months for {tid}')
+    a=month_idx(anchor);win12={ym(i) for i in range(a-11,a+1)};win24={ym(i) for i in range(a-23,a+1)}
+    previous={ym(i) for i in range(a-23,a-11)}
+    result=dict(trader)
+    for flow,records in [('Import',im),('Export',ex)]:
+        for n,window in [(12,win12),(24,win24)]:
+            result[f'{flow} active months ({n}m)']=len({m for m,c in records if m in window})
+            result[f'{flow} published lines ({n}m)']=sum(m in window for m,c in records)
+        result[f'{flow} previous 12m active months']=len({m for m,c in records if m in previous})
+        result[f'{flow} commodity codes (24m)']=', '.join(sorted({c for m,c in records if m in win24 and c}))
+        seen=[m for m,c in records if m in win24]
+        result[f'Latest {flow.lower()}']=month_name(max(seen)) if seen else 'Not observed'
+        result[f'{flow} last activity lag (months)']=a-month_idx(max(seen)) if seen else None
+        for yr in sorted({ym(i)//100 for i in range(a-23,a+1)}):
+            result[f'{flow} active months {yr}']=len({m for m,c in records if m//100==yr and m in win24})
+    i=result['Import active months (12m)'];e=result['Export active months (12m)']
+    i24=result['Import active months (24m)'];e24=result['Export active months (24m)']
+    result['Trade direction']='Both' if i and e else 'Importer' if i else 'Exporter' if e else 'Historical activity' if i24 or e24 else 'No published activity observed'
+    peak=max(i,e)
+    result['Tier']='A' if peak>=10 else 'B' if peak>=4 else 'C' if peak>=1 else 'Historical' if i24 or e24 else 'Unverified'
+    lag=min([v for v in [result['Import last activity lag (months)'],result['Export last activity lag (months)']] if v is not None],default=999)
+    result['Sales priority']='High' if result['Tier']=='A' and lag<=3 else 'Medium' if result['Tier'] in ('A','B') and lag<=6 else 'Low' if i24 or e24 else 'Research'
+    current=max(i,e);prior=max(result['Import previous 12m active months'],result['Export previous 12m active months'])
+    result['Trend']='Growing' if current>prior+2 else 'Declining' if prior>current+2 else 'Stable / mixed'
+    hs={'22':'Beverages — review specific products','27':'Fuels — specialist review','30':'Pharmaceuticals — specialist review','39':'Plastics','40':'Rubber','48':'Paper / packaging','61':'Knitted apparel','62':'Woven apparel','72':'Iron / steel','73':'Steel articles','84':'Machinery','85':'Electrical equipment','87':'Vehicles / parts','90':'Precision instruments'}
+    codes={c for m,c in im+ex if m in win24 and c}
+    result['Commodity groups (indicative)']=', '.join(sorted({hs.get(c[:2],'HS'+c[:2]) for c in codes})) or 'Not classified'
+    result['HMRC trader profile']='https://www.uktradeinfo.com/traders/'+re.sub(r'[^a-z0-9]+','-',trader['Company'].lower()).strip('-')+'-'+tid
+    result['Evidence status']='Verified: matched published commodity-month records' if i24 or e24 else 'No matched published activity in 24m'
+    result['Data window end']=month_name(anchor)
+    result['Sales rationale']=f"{result['Trade direction']}; {i}/12 import months, {e}/12 export months; last observed import {result['Latest import']}, export {result['Latest export']}. Verify freight fit, decision maker and CRM ownership."
+    result['CRM status']='Not checked';result['Operating site']='Not verified'
+    result['Shipment count']='Not available from this dataset'
+    return result
 
 mode=st.segmented_control('Search type',['Company name','Postcode area','Radius'],default='Postcode area')
-if mode=='Company name':
-    search_value=st.text_input('Trader / company name',placeholder='e.g. Funko UK')
-elif mode=='Postcode area':
-    search_value=st.text_input('Postcode area / district',value='WS10')
+if mode=='Company name':q=st.text_input('HMRC trader / company name',placeholder='Eden Horticulture Limited')
+elif mode=='Postcode area':q=st.text_input('Postcode area or district',value='WS10')
 else:
-    search_value=st.text_input('Full postcode',value='CV3 4PW')
-    radius=st.slider('Radius in miles (approximate coverage)',1,15,10)
-limit=st.select_slider('Maximum candidate traders (not a limit on shipments)',options=[100,250,500,1000,2000,5000],value=500)
-with st.expander('Advanced retrieval settings',expanded=False):
-    activity_limit=st.select_slider('Safety limit: activity records per direction',options=[10000,30000,60000,100000,200000],value=100000)
-    st.caption('This is a safety limit for API retrieval, NOT a shipment limit. If reached, activity scoring is withheld. Larger searches may be slow.')
-verified_only=st.checkbox('Show verified trading prospects only',value=True,key='verified_filter',help='Hide directory-only accounts. A verified record means at least one published commodity-month import or export record within the 24-month analysis window.')
-with st.expander('How to interpret the evidence'):
-    st.write('The app queries up to 30 calendar months of published HMRC commodity-month records and compares the latest 12 and 24 months ending with the most recent month observed in THIS search. This is a local proxy, not a verified national publication calendar.')
-    st.write('Tier A: 10–12 active months in either trade direction; B: 4–9; C: 1–3. Activity is not shipment frequency or freight value. Priority is a research heuristic, not a sales forecast.')
-    st.write('If a trader or activity record cap is reached, activity scores are withheld or the trader list is flagged incomplete. Registered office locations may not be freight operating sites.')
+    q=st.text_input('Full postcode',value='CV3 4PB')
+    radius=st.slider('Distance in miles',1,15,5)
+verified=st.checkbox('Show only traders with matched published activity',value=True)
+with st.expander('Advanced settings — retrieval and reporting'):
+    anchor=st.text_input('Reporting window end (YYYYMM)',value='202609',help='Use the SAME month for every search. Change only after confirming HMRC has published newer data.')
+    candidate_limit=st.select_slider('Maximum directory candidates to discover',options=[100,250,500,1000,2000,5000],value=1000)
+    verify_limit=st.select_slider('Maximum traders to verify individually',options=[20,50,100,200,400],value=100)
+    per_trader_limit=st.select_slider('Maximum records per trader per direction',options=[2000,5000,10000,30000],value=10000)
+    workers=st.slider('Concurrent trader checks',1,6,4)
+    st.caption('Company and postcode searches use the SAME Trader ID activity method. Large searches may take minutes. Reaching a candidate or verification cap means results are not exhaustive.')
 
 if st.button('🔎 Search HMRC traders',type='primary',use_container_width=True):
-    code=clean(search_value)
-    if mode=='Company name' and len(search_value.strip())<3:
-        st.error('Enter at least 3 characters of the company name.')
-    elif mode=='Postcode area' and not re.fullmatch(r'[A-Z]{1,2}(\d{1,2}[A-Z]?)?',code):
-        st.error('Enter an area or district such as WS or WS10.')
-    elif mode=='Radius' and not re.fullmatch(r'[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}',code):
-        st.error('Enter a full postcode such as CV3 4PW.')
-    else:
-        try:
-            start,end=query_window()
-            st.session_state.pop('result',None)
-            st.session_state.pop('coverage',None)
-            incomplete=False; truncated=False; notes=[]
-            with st.spinner('Retrieving HMRC traders and trade evidence…'):
-                if mode=='Company name':
-                    traders,truncated=fetch_traders('',limit,company_name=search_value.strip())
-                    prefixes=sorted({outward_code(t.get('PostCode','')) for t in traders})
-                    prefixes=[x for x in prefixes if x]
-                    if len(prefixes)>20:notes.append('Company results span more than 20 postcode districts; trade evidence may take a long time.')
-                elif mode=='Postcode area':
-                    prefixes=[code]
-                    traders,truncated=fetch_traders(code,limit)
-                    # Some HMRC postcode formatting / API behavior can cause district queries
-                    # to return zero despite matching records in the broader area.
-                    if not traders and re.search(r'\d',code):
-                        area=re.match(r'^[A-Z]{1,2}',code).group()
-                        fallback,fallback_partial=fetch_traders(area,max(limit,5000))
-                        traders=[t for t in fallback if outward_code(t.get('PostCode',''))==code][:limit]
-                        truncated=fallback_partial or len(traders)>=limit
-                        notes.append('Direct district query returned no records; broader area fallback was used.' +
-                                     (' The fallback was capped and may miss matching traders.' if fallback_partial else ''))
-                else:
-                    prefixes,geo_cap,geo_range=nearby_outcodes(code,radius)
-                    if geo_cap:notes.append('Postcode district discovery reached the 100-outcode API limit; coverage may be incomplete.')
-                    if geo_range:notes.append('Postcode district discovery radius was limited by the geocoding API; coverage may be incomplete.')
-                    if len(prefixes)>35:
-                        notes.append(f'Only 35 of {len(prefixes)} candidate postcode districts searched; results are incomplete.')
-                        prefixes=prefixes[:35]
-                    traders=[]
-                    for pref in prefixes:
-                        remaining=limit-len(traders)
-                        if remaining<=0:truncated=True;break
-                        batch,cap_hit=fetch_traders(pref,remaining)
-                        traders.extend(batch)
-                        truncated=truncated or cap_hit
-                df=pd.DataFrame([row_to_record(t) for t in traders],columns=['Trader ID','Company','Postcode','Registered address'])
-                df=df.drop_duplicates(subset=['Trader ID'])
-                if mode=='Postcode area' and re.search(r'\d',code):
-                    df=df[df['Postcode'].map(outward_code)==code].copy()
-                if mode=='Radius' and not df.empty:
-                    loc=lookup_postcodes(tuple(sorted(set([code]+[clean(x) for x in df['Postcode'].dropna()]))))
-                    if code not in loc:raise ValueError('Origin postcode not found')
-                    df['Miles away']=df['Postcode'].map(lambda x:round(distance(loc[code],loc[clean(x)]),1) if clean(x) in loc else float('nan'))
-                    df=df[df['Miles away']<=radius].copy()
-                    missing_geo=len(traders)-len(loc)+1
-                    if missing_geo>0:notes.append('Some trader postcodes could not be geocoded and may have been excluded.')
-                if df.empty:
-                    notes.append('No matching traders found. Try a broader company name or postcode area.')
-                imports=[];exports=[]
-                # Search each postcode district separately and deduplicate activity records.
-                # Limits and partial coverage are surfaced rather than treated as complete evidence.
-                if mode=='Company name' and not df.empty:
-                    # Targeted company search: exact trader IDs, independent of postcode activity density.
-                    for tid in df['Trader ID']:
-                        if len(imports)>=activity_limit or len(exports)>=activity_limit:
-                            incomplete=True;break
-                        im,ic=fetch_trader_activity(tid,'Import',start,end,activity_limit-len(imports))
-                        ex,ec=fetch_trader_activity(tid,'Export',start,end,activity_limit-len(exports))
-                        imports.extend(im);exports.extend(ex)
-                        incomplete=incomplete or ic or ec
-                        if incomplete:break
-                else:
-                    for pref in (prefixes if not df.empty else []):
-                        if len(imports)>=activity_limit or len(exports)>=activity_limit:
-                            incomplete=True;break
-                        im,ic=fetch_activity(pref,'Import',start,end,activity_limit-len(imports))
-                        ex,ec=fetch_activity(pref,'Export',start,end,activity_limit-len(exports))
-                        imports.extend(im);exports.extend(ex)
-                        incomplete=incomplete or ic or ec
-                        if incomplete:break
-                if truncated:notes.append('Trader retrieval limit reached BEFORE geographic filtering. Radius results are a SAMPLE, not all traders within the circle.')
-                if incomplete:notes.append('Trade activity retrieval was incomplete or hit the safety limit; scores withheld.')
-                if not incomplete and not df.empty:
-                    # Activity queries are district-wide; only score the selected trader IDs.
-                    ids=set(df['Trader ID'].astype(str))
-                    imports=[x for x in imports if str(x.get('TraderId','')) in ids]
-                    exports=[x for x in exports if str(x.get('TraderId','')) in ids]
-                    if imports or exports:
-                        df,coverage=score_records(df,imports,exports)
-                        st.session_state['coverage']=coverage
+    st.session_state.pop('report',None)
+    try:
+        code=clean(q)
+        if not valid_ym(anchor):raise ValueError('Reporting window must be YYYYMM, for example 202609')
+        anchor=int(anchor);start=ym(month_idx(anchor)-23)
+        if mode=='Company name' and len(q.strip())<3:raise ValueError('Enter at least three characters')
+        if mode=='Postcode area' and not re.fullmatch(r'[A-Z]{1,2}(?:\d{1,2}[A-Z]?)?',code):raise ValueError('Enter a postcode area or district such as TF or TF2')
+        if mode=='Radius' and not re.fullmatch(r'[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}',code):raise ValueError('Enter a full postcode such as CV3 4PB')
+        notes=[];partial=False;discovery=[];source=[]
+        with st.spinner('Discovering traders…'):
+            if mode=='Company name':
+                discovery,cap,pages=traders_by_name(q.strip(),candidate_limit)
+                source=[f'Name: {q.strip()} ({pages} pages)'];partial|=cap
+            elif mode=='Postcode area':
+                discovery,cap,pages,method=traders_by_prefix(code,candidate_limit)
+                source=[f'{code}: {method} ({pages} pages)'];partial|=cap
+            else:
+                districts,geo_cap,geo_short=radius_outcodes(code,radius)
+                if geo_cap or geo_short:partial=True;notes.append('Geographic district discovery was limited; radius coverage is incomplete.')
+                if len(districts)>35:partial=True;notes.append(f'Only 35 of {len(districts)} districts scanned.');districts=districts[:35]
+                for d in districts:
+                    batch,cap,pages,method=traders_by_prefix(d,candidate_limit)
+                    discovery.extend(batch);source.append(f'{d}: {method} ({pages} pages)')
+                    partial|=cap
+        candidates=pd.DataFrame([row(t) for t in discovery],columns=['Trader ID','Company','Postcode','Registered address'])
+        candidates=candidates[candidates['Trader ID'].str.fullmatch(r'\d+',na=False)].drop_duplicates('Trader ID')
+        if mode=='Postcode area':
+            candidates=candidates[candidates['Postcode'].map(clean).str.startswith(code)].copy()
+            if re.search(r'\d',code):candidates=candidates[candidates['Postcode'].map(outcode)==code].copy()
+        if mode=='Radius' and not candidates.empty:
+            codes=tuple(sorted({code}|set(candidates['Postcode'].map(clean))))
+            coords=location_for_postcodes(codes)
+            if code not in coords:raise ValueError('Unable to geocode search postcode')
+            candidates['Miles away']=candidates['Postcode'].map(lambda p:round(miles(coords[code],coords[clean(p)]),2) if clean(p) in coords else float('nan'))
+            missing=int(candidates['Miles away'].isna().sum())
+            if missing:notes.append(f'{missing} traders excluded because postcode geocoding was unavailable.')
+            candidates=candidates[candidates['Miles away']<=radius].copy()
+        # No arbitrary A/B/C score is inferred for companies not individually checked.
+        discovered=len(candidates)
+        if discovered>verify_limit:
+            partial=True;notes.append(f'Only {verify_limit} of {discovered} discovered traders individually checked. Increase the verification limit or narrow the search.')
+        selected=candidates.head(verify_limit).to_dict('records')
+        records=[];errors=[];no_evidence=0;total_pages=0
+        progress=st.progress(0,text='Verifying individual Trader IDs…')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            tasks={pool.submit(evidence_for_trader,r['Trader ID'],start,anchor,per_trader_limit):r for r in selected}
+            for n,fut in enumerate(concurrent.futures.as_completed(tasks),1):
+                r=tasks[fut]
+                try:
+                    tid,im,ex,cap,pages=fut.result();total_pages+=pages
+                    if cap:
+                        errors.append(f"{r['Company']} ({tid}): evidence cap reached; not scored")
                     else:
-                        notes.append('No dated import/export evidence matched these trader IDs in the selected window. Check HMRC trader details and reporting period.')
-                        incomplete=True
-                st.session_state['result']=df
-                st.session_state['truncated']=truncated
-                st.session_state['period']=(start,end)
-                st.session_state['activity_incomplete']=incomplete
-                st.session_state['search_notes']=notes
-                st.session_state['retrieval_diagnostics']={'Search mode':mode,'Postcode districts queried':len(prefixes),'Traders returned before filtering':len(traders),'Traders after filtering':len(df),'Import commodity-month rows retrieved':len(imports),'Export commodity-month rows retrieved':len(exports),'Trader result truncated':truncated,'Activity incomplete':incomplete}
-        except Exception as exc:
-            st.error(f'Search failed: {exc}')
-            st.info('Check the Streamlit app logs for the full error details. An API failure does not mean the trader has no activity.')
+                        scored=score(r,im,ex,anchor)
+                        if scored['Tier']=='Unverified':no_evidence+=1
+                        records.append(scored)
+                except Exception as exc:errors.append(f"{r['Company']} ({r['Trader ID']}): {exc}")
+                progress.progress(n/max(1,len(tasks)),text=f'Checked {n}/{len(tasks)} traders')
+        progress.empty()
+        if errors:partial=True;notes.append(f'{len(errors)} trader evidence checks failed or were capped. Their activity has NOT been scored as zero.')
+        result=pd.DataFrame(records)
+        st.session_state['report']={'data':result,'notes':notes,'partial':partial,'discovered':discovered,'checked':len(selected),'no_evidence':no_evidence,'errors':errors,'sources':source,'pages':total_pages,'mode':mode,'anchor':anchor,'verified_default':verified}
+    except Exception as exc:st.error(f'Search failed: {exc}');st.info('An API error or incomplete search does not mean a trader has no trade activity.')
 
-if 'result' in st.session_state:
-    df=st.session_state['result'].copy()
-    # Preserve the verified-only preference between Streamlit reruns.
-    verified_only=st.session_state.get('verified_filter',True)
-    coverage=st.session_state.get('coverage') if not st.session_state.get('activity_incomplete') else None
-    for note in st.session_state.get('search_notes',[]):st.warning(note)
-    if st.session_state.get('truncated'):
-        st.warning('Trader retrieval hit the selected cap: this is a PARTIAL list, not all traders in the territory.')
-    if st.session_state.get('activity_incomplete'):
-        st.error('Trade evidence is incomplete or unavailable. Company discovery may still be useful, but activity, tier and priority are UNVERIFIED. Narrow the search or adjust Advanced retrieval settings.')
-    if coverage:
-        st.info(f"Trade evidence ends {month_label(coverage['latest'])} (latest observed in this search). "
-                f"Observed months in this search: {coverage['months12']}/12 and {coverage['months24']}/24. "
-                'This does not independently verify HMRC publication coverage.')
-        with st.expander('Sales filters',expanded=False):
-            direction=st.selectbox('Trade direction',['All','Importer','Exporter','Both','Historical / review','Not observed'])
-            tiers=st.multiselect('Activity tier',['A','B','C','Unconfirmed'],default=['A','B','C','Unconfirmed'])
-            priorities=st.multiselect('Sales priority',['High','Medium','Low','Research'],default=['High','Medium','Low','Research'])
-            trends=st.multiselect('12m versus prior 12m',['Newer / growing','Steady / mixed','Reduced activity','Unknown'],default=['Newer / growing','Steady / mixed','Reduced activity','Unknown'])
-            min_months=st.slider('Minimum import OR export active months (12m)',0,12,0)
-            exclude=st.text_input('Exclude commodity code prefixes (comma-separated, e.g. 22)',value='')
-        if direction=='Importer':df=df[df['Import active months (12m)']>0]
-        elif direction=='Exporter':df=df[df['Export active months (12m)']>0]
-        elif direction!='All':df=df[df['Trade direction']==direction]
-        df=df[df['Tier'].isin(tiers)&df['Sales priority'].isin(priorities)&df['Trend'].isin(trends)]
-        if verified_only:
-            df=df[(df['Import active months (24m)']>0)|(df['Export active months (24m)']>0)].copy()
-        df=df[df[['Import active months (12m)','Export active months (12m)']].max(axis=1)>=min_months]
-        terms=[x.strip() for x in exclude.split(',') if x.strip()]
-        if terms:
-            import re as _re
-            for term in terms:
-                # Compare commodity codes as individual tokens; avoid partial matches mid-code.
-                pat=r'(?<!\d)'+_re.escape(term)
-                df=df[~(df['Import commodity codes (24m)'].str.contains(pat,regex=True,na=False) |
-                        df['Export commodity codes (24m)'].str.contains(pat,regex=True,na=False))]
-        rank={'High':0,'Medium':1,'Low':2,'Research':3}
-        df=df.assign(_rank=df['Sales priority'].map(rank)).sort_values(
-            ['_rank','Import active months (12m)','Export active months (12m)'],
-            ascending=[True,False,False]).drop(columns='_rank')
-    if not coverage and verified_only:
-        # Never present unverified directory accounts as qualified prospects.
-        df=df.iloc[0:0].copy()
+if 'report' in st.session_state:
+    report=st.session_state['report'];df=report['data'].copy()
+    if not df.empty and verified:df=df[df['Tier']!='Unverified'].copy()
     if not df.empty:
-        df['HMRC trader profile']=df.apply(lambda r: 'https://www.uktradeinfo.com/traders/'+re.sub(r'[^a-z0-9]+','-',str(r['Company']).lower()).strip('-')+'-'+str(r['Trader ID']),axis=1)
-    # Schema stability: retrieval failures must never crash tables or CSV downloads.
-    defaults={'Trade direction':'Unverified','Tier':'Unverified','Sales priority':'Research',
-              'Trend':'Unknown','Commodity groups (indicative)':'Unknown',
-              'Specialist handling review':'Not assessed','Sales rationale':'Trade evidence unavailable or incomplete; research before outreach.',
-              'CRM status':'Not checked','Site confidence':'Operating site unverified',
-              'Contact enrichment':'Not performed','Latest import':'Not verified','Latest export':'Not verified',
-              'Import active months (12m)':pd.NA,'Export active months (12m)':pd.NA,
-              'Import active months (24m)':pd.NA,'Export active months (24m)':pd.NA}
-    for column,default in defaults.items():
-        if column not in df.columns:df[column]=default
-    a,b,c=st.columns(3)
-    a.metric('Prospects',f'{len(df):,}')
-    b.metric('A-tier',f'{(df["Tier"]=="A").sum():,}' if 'Tier' in df else '—')
-    c.metric('High priority',f'{(df["Sales priority"]=="High").sum():,}' if 'Sales priority' in df else '—')
-    with st.expander('Retrieval diagnostics',expanded=False):
-        st.json(st.session_state.get('retrieval_diagnostics',{}))
-        st.caption('A zero activity count is not conclusive if retrieval is incomplete. For company-name tests, check that records were returned by the TraderId-filtered import/export requests.')
-    if df.empty:
-        st.info('No VERIFIED trading prospects can be shown from this search. If evidence retrieval failed, this is NOT proof that companies have no trade. Turn off the verified-only checkbox to inspect discovered directory accounts and review retrieval diagnostics.')
+        with st.expander('Sales filters'):
+            priorities=st.multiselect('Sales priority',['High','Medium','Low','Research'],default=['High','Medium','Low','Research'])
+            directions=st.multiselect('Trade direction',['Both','Importer','Exporter','Historical activity','No published activity observed'],default=['Both','Importer','Exporter','Historical activity','No published activity observed'])
+            minimum=st.slider('Minimum active months in either direction (12m)',0,12,0)
+        df=df[df['Sales priority'].isin(priorities)&df['Trade direction'].isin(directions)]
+        df=df[df[['Import active months (12m)','Export active months (12m)']].max(axis=1)>=minimum]
+        ranks={'High':0,'Medium':1,'Low':2,'Research':3}
+        df=df.assign(_sort=df['Sales priority'].map(ranks)).sort_values(['_sort','Import active months (12m)','Export active months (12m)'],ascending=[True,False,False]).drop(columns='_sort')
+    for note in report['notes']:st.warning(note)
+    if report['partial']:st.error('PARTIAL COVERAGE — do not interpret this list as every active trader in the territory.')
+    st.info(f"All trader activity is evaluated against the SAME fixed 24-month window ending {month_name(report['anchor'])}. Each trader is matched by its own HMRC Trader ID. These are commodity-month records, NOT shipments.")
+    a,b,c=st.columns(3);a.metric('Verified prospects',len(df));b.metric('A-tier',int((df['Tier']=='A').sum()) if 'Tier' in df else 0);c.metric('High priority',int((df['Sales priority']=='High').sum()) if 'Sales priority' in df else 0)
+    st.caption(f"Directory candidates in territory: {report['discovered']:,} · Trader IDs individually checked: {report['checked']:,} · Complete checks with no activity: {report['no_evidence']:,} · Failed/capped checks: {len(report['errors']):,}")
+    with st.expander('Retrieval diagnostics and exceptions'):
+        st.write('Search mode:',report['mode']);st.write('Trader activity pages fetched:',report['pages'])
+        st.write('Directory queries:',report['sources'])
+        if report['errors']:st.code('\n'.join(report['errors'][:100]))
+    if df.empty:st.warning('No verified traders displayed. This may be due to limited candidate coverage, failed checks, reporting-window settings, or genuinely absent published records.')
     else:
-        focus=['Company','Postcode','Trade direction','Tier','Sales priority',
-               'Import active months (12m)','Export active months (12m)',
-               'Import active months (24m)','Export active months (24m)',
-               'Latest import','Latest export','Trend','HMRC trader profile','Commodity groups (indicative)','Specialist handling review','Sales rationale']
-        st.subheader('Prospect shortlist')
-        st.dataframe(df[[x for x in focus if x in df]],hide_index=True,use_container_width=True)
-        with st.expander('Full analytical dataset'):
+        cols=['Company','Postcode','Trade direction','Tier','Sales priority','Import active months (12m)','Export active months (12m)','Import active months (24m)','Export active months (24m)','Latest import','Latest export','Trend','Commodity groups (indicative)','HMRC trader profile','Evidence status','Sales rationale']
+        st.subheader('Verified sales prospects')
+        st.dataframe(df[[c for c in cols if c in df]],hide_index=True,use_container_width=True)
+        st.download_button('⬇️ Sales-ready CSV',df[[c for c in cols if c in df]+['Trader ID']].to_csv(index=False).encode('utf-8-sig'),'hmrc_sales_ready_v4_6.csv','text/csv',use_container_width=True)
+        st.download_button('⬇️ Full evidence CSV',df.to_csv(index=False).encode('utf-8-sig'),'hmrc_full_evidence_v4_6.csv','text/csv',use_container_width=True)
+        with st.expander('Full evidence and calendar-year activity'):
             st.dataframe(df,hide_index=True,use_container_width=True)
-        st.download_button('⬇️ Export sales-ready CSV',
-            df[[x for x in focus if x in df]+[x for x in ['Trader ID','Registered address','CRM status','Site confidence','Contact enrichment'] if x in df.columns]].to_csv(index=False).encode('utf-8-sig'),
-            'hmrc_sales_ready_v4_5.csv','text/csv',use_container_width=True)
-        st.download_button('⬇️ Export full evidence CSV',
-            df.to_csv(index=False).encode('utf-8-sig'),
-            'hmrc_full_evidence_v4_5.csv','text/csv',use_container_width=True)
-        st.caption('AI enrichment: upload sales-ready CSV only to an organisation-approved platform; verify company identity, freight suitability and CRM ownership before outreach.')
-st.divider()
-st.caption('V4.5 validation release · Company name and multi-district radius search · Radius coverage is a sampled approximation and may be incomplete · HMRC trade lines are not shipment counts.')
+    st.caption('Note: Calendar-year counts are limited to the selected 24-month window; they are not necessarily full-year totals. Registered addresses may differ from operating sites.')
