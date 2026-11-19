@@ -243,16 +243,16 @@ if 'result' in st.session_state:
     if 'Trade direction' in df.columns:
         direction=st.selectbox('Trade direction',['All','Importer','Exporter','Both'])
         tiers=st.multiselect('Priority tier',['A','B','C','Unconfirmed'],default=['A','B','C','Unconfirmed'])
-        if direction=='Importer':df=df[df['Import months']>0]
-        elif direction=='Exporter':df=df[df['Export months']>0]
+        if direction=='Importer':df=df[df['Import active months (12m)']>0]
+        elif direction=='Exporter':df=df[df['Export active months (12m)']>0]
         elif direction=='Both':df=df[df['Trade direction']=='Both']
         df=df[df['Tier'].isin(tiers)]
-        df=df.sort_values(['Import months','Export months'],ascending=[False,False])
+        df=df.sort_values(['Import active months (12m)','Export active months (12m)'],ascending=[False,False])
     if "Trade direction" in df.columns:
         priority = st.multiselect("Sales priority", ["High", "Medium", "Low", "Review"],
                                   default=["High", "Medium", "Low", "Review"])
         df = df[df["Priority"].isin(priority)]
-        recent_only = st.checkbox("Only show companies with recent activity (last 3 published months)")
+        recent_only = st.checkbox("Only show companies with recent activity (within 2 months of the latest complete calendar month)")
         if recent_only:
             df = df[df["Recency"] == "Recent"]
         commodity_exclude = st.text_input("Exclude commodity ID keywords (comma-separated)", "")
