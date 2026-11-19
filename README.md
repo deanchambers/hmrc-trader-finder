@@ -1,22 +1,23 @@
-# UK Trader Finder — mobile web starter
+# HMRC Freight Sales Intelligence — v3
 
-This is a responsive Streamlit web app, intended to run on a server and open on your iPhone in Safari.
+Replace your GitHub repository's `app.py` and `requirements.txt` with these files. Streamlit Cloud will automatically redeploy.
 
-## Publish with Streamlit Community Cloud
-1. Create a **private** GitHub repository (check Streamlit hosting visibility and access controls before uploading any confidential data).
-2. Upload `app.py`, `requirements.txt`, and `.streamlit/config.toml` to the repository.
-3. Visit https://share.streamlit.io/ and sign in with GitHub.
-4. Choose **Create app**, select the repository and `app.py`, then deploy.
-5. Open the resulting URL on your phone. In Safari, Share > Add to Home Screen for an app-like shortcut.
+## Features
+- HMRC trader search by postcode area/district
+- Import and export activity over 12 complete calendar months
+- Direction, observed months, first/last month, published commodity-month lines, commodity IDs
+- A/B/C tiers and heuristic sales priority, reason to contact
+- Filters and CSV export ready for a separate approved enrichment agent
 
-## Local run
-`pip install -r requirements.txt`
-`streamlit run app.py`
+## Caveats
+- Live HMRC Import/Export endpoint filters are **not verified end-to-end** from this environment. Check Streamlit logs if they fail.
+- Published commodity-month records are **not shipment counts** and do not give freight values.
+- The app queries the latest 12 *complete calendar* months; HMRC publication can lag, making recency appear older than it is. A future version should use latest *published* month.
+- Activity caps: if either direction hits the cap, the app withholds scoring. Trader cap means company results may be partial.
+- Radius mode only covers the origin postcode district; it is NOT complete radius coverage.
+- Commodity filtering currently works on commodity IDs, not descriptions. Verify ID mapping before excluding regulated goods.
+- Registered address may not be the operating site.
+- Review organisation policy before sending prospect data to external AI services.
 
-## Important limitations
-- **Not live-tested** against HMRC from this environment. The HMRC API OData endpoint and field names must be verified after deployment.
-- This version deliberately does **not** display fabricated import/export activity or A/B/C tiers. Those require an additional, tested HMRC data retrieval pipeline.
-- Radius mode currently searches **only the origin postcode district**, then filters its results by straight-line distance. It is incomplete for nearby postcode districts.
-- Postcode location may reflect a registered address, not a warehouse.
-- The application runs on a hosting service; it does not execute Python on the phone.
-- The app makes outbound requests to HMRC and postcodes.io; review organisational data policies and API usage terms.
+## Quick validation
+Search WS10 with a low maximum trader count. Confirm columns show 'Trade direction', 'Import active months (12m)', 'Export active months (12m)', 'Latest import (12m)', 'Latest export (12m)', 'Priority', 'Why contact'. If not, check the app's error message/logs.
